@@ -342,6 +342,7 @@ export async function exec(
       commandTimeout,
       taskOutput,
       shouldAutoBackground,
+      provider.detached,
     )
 
     // Close our copy of the fd — the child has its own dup.

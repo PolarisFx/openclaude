@@ -825,7 +825,7 @@ export const BashTool = buildTool({
     return isOutputLineTruncated(output.stdout) || isOutputLineTruncated(output.stderr);
   }
 } satisfies ToolDef<InputSchema, Out, BashProgress>);
-async function* runShellCommand({
+export async function* runShellCommand({
   input,
   abortController,
   setAppState,
@@ -865,11 +865,20 @@ async function* runShellCommand({
   let lastTotalLines = 0;
   let lastTotalBytes = 0;
   let backgroundShellId: string | undefined = undefined;
+  let interruptBackgroundingStarted = false;
   let assistantAutoBackgrounded = false;
+  let foregroundTaskId: string | undefined = undefined;
 
   // Progress signal: resolved by onProgress callback from the shared poller,
   // waking the generator to yield a progress update.
   let resolveProgress: (() => void) | null = null;
+  function wakeProgressWaiter(): void {
+    const resolve = resolveProgress;
+    if (resolve) {
+      resolveProgress = null;
+      resolve();
+    }
+  }
   function createProgressSignal(): Promise<null> {
     return new Promise<null>(resolve => {
       resolveProgress = () => resolve(null);
@@ -888,11 +897,7 @@ async function* runShellCommand({
       lastTotalLines = totalLines;
       lastTotalBytes = isIncomplete ? totalBytes : 0;
       // Wake the generator so it yields the new progress data
-      const resolve = resolveProgress;
-      if (resolve) {
-        resolveProgress = null;
-        resolve();
-      }
+      wakeProgressWaiter();
     },
     preventCwdChanges,
     shouldUseSandbox: shouldUseSandbox(input),
@@ -933,6 +938,7 @@ async function* runShellCommand({
         return;
       }
       backgroundShellId = foregroundTaskId;
+      wakeProgressWaiter();
       logEvent(eventName, {
         command_type: getCommandTypeForLogging(command)
       });
@@ -950,11 +956,7 @@ async function* runShellCommand({
       // (no output + shared-poller race with sibling stopPolling calls)
       // and the process is hung on I/O, the race at line ~1357 never
       // resolves and the generator deadlocks despite being backgrounded.
-      const resolve = resolveProgress;
-      if (resolve) {
-        resolveProgress = null;
-        resolve();
-      }
+      wakeProgressWaiter();
       logEvent(eventName, {
         command_type: getCommandTypeForLogging(command)
       });
@@ -963,6 +965,31 @@ async function* runShellCommand({
       }
     });
   }
+
+  function handleInterruptBackgrounding(): void {
+    if (
+      interruptBackgroundingStarted ||
+      !abortController.signal.aborted ||
+      abortController.signal.reason !== 'interrupt'
+    ) {
+      return;
+    }
+    interruptBackgroundingStarted = true;
+    if (!isBackgroundTasksDisabled) {
+      startBackgrounding('tengu_bash_command_interrupt_backgrounded');
+      return;
+    }
+    shellCommand.kill();
+    wakeProgressWaiter();
+  }
+
+  const interruptAbortHandler = (): void => {
+    handleInterruptBackgrounding();
+  };
+  abortController.signal.addEventListener('abort', interruptAbortHandler, {
+    once: true
+  });
+  handleInterruptBackgrounding();
 
   // Set up auto-backgrounding on timeout if enabled
   // Only background commands that are allowed to be auto-backgrounded (not sleep, etc.)
@@ -1004,12 +1031,12 @@ async function* runShellCommand({
 
   // Wait for the initial threshold before showing progress
   const startTime = Date.now();
-  let foregroundTaskId: string | undefined = undefined;
   {
+    const initialProgressSignal = createProgressSignal();
     const initialResult = await Promise.race([resultPromise, new Promise<null>(resolve => {
       const t = setTimeout((r: (v: null) => void) => r(null), PROGRESS_THRESHOLD_MS, resolve);
       t.unref();
-    })]);
+    }), initialProgressSignal]);
     if (initialResult !== null) {
       shellCommand.cleanup();
       return initialResult;
@@ -1023,6 +1050,11 @@ async function* runShellCommand({
         backgroundTaskId: backgroundShellId,
         assistantAutoBackgrounded
       };
+    }
+    if (interruptBackgroundingStarted && isBackgroundTasksDisabled) {
+      const interruptedResult = await resultPromise;
+      shellCommand.cleanup();
+      return interruptedResult;
     }
   }
 
@@ -1079,7 +1111,7 @@ async function* runShellCommand({
       // Check if command was backgrounded (either via old mechanism or new backgroundAll)
       if (backgroundShellId) {
         return {
-          stdout: '',
+          stdout: interruptBackgroundingStarted ? fullOutput : '',
           stderr: '',
           code: 0,
           interrupted: false,
@@ -1140,6 +1172,7 @@ async function* runShellCommand({
       };
     }
   } finally {
+    abortController.signal.removeEventListener('abort', interruptAbortHandler);
     TaskOutput.stopPolling(shellCommand.taskOutput.taskId);
   }
 }

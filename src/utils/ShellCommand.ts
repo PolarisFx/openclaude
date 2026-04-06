@@ -127,6 +127,7 @@ class ShellCommandImpl implements ShellCommand {
     | undefined
   #timeout: number
   #shouldAutoBackground: boolean
+  #killProcessGroup: boolean
   #resultResolver: ((result: ExecResult) => void) | null = null
   #exitCodeResolver: ((code: number) => void) | null = null
   #boundAbortHandler: (() => void) | null = null
@@ -151,6 +152,7 @@ class ShellCommandImpl implements ShellCommand {
     timeout: number,
     taskOutput: TaskOutput,
     shouldAutoBackground = false,
+    killProcessGroup = false,
     maxOutputBytes = MAX_TASK_OUTPUT_BYTES,
   ) {
     this.#childProcess = childProcess
@@ -158,6 +160,7 @@ class ShellCommandImpl implements ShellCommand {
     this.#timeout = timeout
     this.#shouldAutoBackground = shouldAutoBackground
     this.#maxOutputBytes = maxOutputBytes
+    this.#killProcessGroup = killProcessGroup
     this.taskOutput = taskOutput
 
     // In file mode (bash commands), both stdout and stderr go to the
@@ -336,8 +339,24 @@ class ShellCommandImpl implements ShellCommand {
 
   #doKill(code?: number): void {
     this.#status = 'killed'
-    if (this.#childProcess.pid) {
-      treeKill(this.#childProcess.pid, 'SIGKILL')
+    const pid = this.#childProcess.pid
+    if (pid) {
+      if (this.#killProcessGroup && process.platform !== 'win32') {
+        try {
+          // Detached POSIX shells run in their own process group. Killing the
+          // group reaches orphaned descendants even after the parent shell has
+          // already exited and been reparented away from the original tree.
+          process.kill(-pid, 'SIGKILL')
+        } catch {
+          try {
+            treeKill(pid, 'SIGKILL')
+          } catch {}
+        }
+      } else {
+        try {
+          treeKill(pid, 'SIGKILL')
+        } catch {}
+      }
     }
     this.#resolveExitCode(code ?? SIGKILL)
   }
@@ -390,6 +409,7 @@ export function wrapSpawn(
   timeout: number,
   taskOutput: TaskOutput,
   shouldAutoBackground = false,
+  killProcessGroup = false,
   maxOutputBytes = MAX_TASK_OUTPUT_BYTES,
 ): ShellCommand {
   return new ShellCommandImpl(
@@ -398,6 +418,7 @@ export function wrapSpawn(
     timeout,
     taskOutput,
     shouldAutoBackground,
+    killProcessGroup,
     maxOutputBytes,
   )
 }
