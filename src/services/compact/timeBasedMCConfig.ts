@@ -28,7 +28,7 @@ export type TimeBasedMCConfig = {
 }
 
 const TIME_BASED_MC_CONFIG_DEFAULTS: TimeBasedMCConfig = {
-  enabled: false,
+  enabled: true,
   gapThresholdMinutes: 60,
   keepRecent: 5,
 }

@@ -175,7 +175,8 @@ import { copyPlanForFork, copyPlanForResume, getPlanSlug, setPlanSlug } from '..
 import { clearSessionMetadata, resetSessionFilePointer, adoptResumedSessionFile, removeTranscriptMessage, restoreSessionMetadata, getCurrentSessionTitle, isEphemeralToolProgress, isLoggableMessage, saveWorktreeState, getAgentTranscript } from '../utils/sessionStorage.js';
 import { deserializeMessages } from '../utils/conversationRecovery.js';
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
-import { resetMicrocompactState } from '../services/compact/microCompact.js';
+import { applyTimeBasedMicrocompact, resetMicrocompactState } from '../services/compact/microCompact.js';
+import { getTimeBasedMCConfig } from '../services/compact/timeBasedMCConfig.js';
 import { runPostCompactCleanup } from '../services/compact/postCompactCleanup.js';
 import { applyToolResultReplacementsToMessages, provisionContentReplacementState, reconstructContentReplacementState, type ContentReplacementRecord } from '../utils/toolResultStorage.js';
 import { partialCompactConversation } from '../services/compact/compact.js';
@@ -3997,6 +3998,48 @@ export function REPL({
       idleHintShownRef.current = false;
     };
   }, [lastQueryCompletionTime, isLoading, addNotification, removeNotification]);
+
+  // Idle compaction: if the session sits untouched after a completed turn,
+  // shrink old compactable tool results without waiting for another prompt.
+  useEffect(() => {
+    if (lastQueryCompletionTime === 0) return;
+    if (isLoading) return;
+
+    const config = getTimeBasedMCConfig();
+    if (!config.enabled) return;
+
+    const idleThresholdMs = config.gapThresholdMinutes * 60_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+
+    const schedule = () => {
+      const lastActivityTime = Math.max(lastQueryCompletionTime, getLastInteractionTime());
+      const remaining = idleThresholdMs - (Date.now() - lastActivityTime);
+      timer = setTimeout(() => {
+        if (disposed) return;
+
+        const latestActivityTime = Math.max(lastQueryCompletionTime, getLastInteractionTime());
+        const latestRemaining = idleThresholdMs - (Date.now() - latestActivityTime);
+        if (latestRemaining > 0) {
+          schedule();
+          return;
+        }
+
+        const compacted = applyTimeBasedMicrocompact(messagesRef.current, getQuerySourceForREPL());
+        if (compacted) {
+          setMessages(compacted.messages);
+        }
+      }, Math.max(0, remaining));
+    };
+
+    schedule();
+    return () => {
+      disposed = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [lastQueryCompletionTime, isLoading, setMessages]);
 
   // Submits incoming prompts from teammate messages or tasks mode as new turns
   // Returns true if submission succeeded, false if a query is already running

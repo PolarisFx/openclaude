@@ -219,6 +219,12 @@ export type MicrocompactResult = {
   }
 }
 
+export type ToolResultCompactionResult = {
+  messages: Message[]
+  clearedToolIds: string[]
+  tokensSaved: number
+}
+
 /**
  * Walk messages and collect tool_use IDs whose tool name is in
  * COMPACTABLE_TOOLS, in encounter order. Shared by both microcompact paths.
@@ -238,6 +244,59 @@ function collectCompactableToolIds(messages: Message[]): string[] {
     }
   }
   return ids
+}
+
+export function compactCompactableToolResults(
+  messages: Message[],
+  keepRecentCount: number,
+  clearedMessage: string = TIME_BASED_MC_CLEARED_MESSAGE,
+): ToolResultCompactionResult | null {
+  const compactableIds = collectCompactableToolIds(messages)
+  const keepRecent = Math.max(1, keepRecentCount)
+  const keepSet = new Set(compactableIds.slice(-keepRecent))
+  const clearSet = new Set(compactableIds.filter(id => !keepSet.has(id)))
+
+  if (clearSet.size === 0) {
+    return null
+  }
+
+  let tokensSaved = 0
+  const result: Message[] = messages.map(message => {
+    if (message.type !== 'user' || !Array.isArray(message.message.content)) {
+      return message
+    }
+    let touched = false
+    const newContent = message.message.content.map(block => {
+      if (
+        block.type === 'tool_result' &&
+        clearSet.has(block.tool_use_id) &&
+        block.content !== clearedMessage
+      ) {
+        tokensSaved += calculateToolResultTokens(block)
+        touched = true
+        return { ...block, content: clearedMessage }
+      }
+      return block
+    })
+    if (!touched) return message
+    return {
+      ...message,
+      message: { ...message.message, content: newContent },
+      // The visible preview text is no longer the full result, so drop the
+      // raw tool payload as well or the live session still retains it in RAM.
+      toolUseResult: undefined,
+    }
+  })
+
+  if (tokensSaved === 0) {
+    return null
+  }
+
+  return {
+    messages: result,
+    clearedToolIds: [...clearSet],
+    tokensSaved,
+  }
 }
 
 // Prefix-match because promptCategory.ts sets the querySource to
@@ -264,7 +323,7 @@ export async function microcompactMessages(
   // tool results now, before the request, to shrink what gets rewritten.
   // Cached MC (cache-editing) is skipped when this fires: editing assumes a
   // warm cache, and we just established it's cold.
-  const timeBasedResult = maybeTimeBasedMicrocompact(messages, querySource)
+  const timeBasedResult = applyTimeBasedMicrocompact(messages, querySource)
   if (timeBasedResult) {
     return timeBasedResult
   }
@@ -443,7 +502,7 @@ export function evaluateTimeBasedTrigger(
   return { gapMinutes, config }
 }
 
-function maybeTimeBasedMicrocompact(
+export function applyTimeBasedMicrocompact(
   messages: Message[],
   querySource: QuerySource | undefined,
 ): MicrocompactResult | null {
@@ -453,59 +512,23 @@ function maybeTimeBasedMicrocompact(
   }
   const { gapMinutes, config } = trigger
 
-  const compactableIds = collectCompactableToolIds(messages)
-
-  // Floor at 1: slice(-0) returns the full array (paradoxically keeps
-  // everything), and clearing ALL results leaves the model with zero working
-  // context. Neither degenerate is sensible — always keep at least the last.
-  const keepRecent = Math.max(1, config.keepRecent)
-  const keepSet = new Set(compactableIds.slice(-keepRecent))
-  const clearSet = new Set(compactableIds.filter(id => !keepSet.has(id)))
-
-  if (clearSet.size === 0) {
+  const compaction = compactCompactableToolResults(messages, config.keepRecent)
+  if (!compaction) {
     return null
   }
-
-  let tokensSaved = 0
-  const result: Message[] = messages.map(message => {
-    if (message.type !== 'user' || !Array.isArray(message.message.content)) {
-      return message
-    }
-    let touched = false
-    const newContent = message.message.content.map(block => {
-      if (
-        block.type === 'tool_result' &&
-        clearSet.has(block.tool_use_id) &&
-        block.content !== TIME_BASED_MC_CLEARED_MESSAGE
-      ) {
-        tokensSaved += calculateToolResultTokens(block)
-        touched = true
-        return { ...block, content: TIME_BASED_MC_CLEARED_MESSAGE }
-      }
-      return block
-    })
-    if (!touched) return message
-    return {
-      ...message,
-      message: { ...message.message, content: newContent },
-    }
-  })
-
-  if (tokensSaved === 0) {
-    return null
-  }
+  const { messages: result, clearedToolIds, tokensSaved } = compaction
 
   logEvent('tengu_time_based_microcompact', {
     gapMinutes: Math.round(gapMinutes),
     gapThresholdMinutes: config.gapThresholdMinutes,
-    toolsCleared: clearSet.size,
-    toolsKept: keepSet.size,
+    toolsCleared: clearedToolIds.length,
+    toolsKept: Math.max(1, config.keepRecent),
     keepRecent: config.keepRecent,
     tokensSaved,
   })
 
   logForDebugging(
-    `[TIME-BASED MC] gap ${Math.round(gapMinutes)}min > ${config.gapThresholdMinutes}min, cleared ${clearSet.size} tool results (~${tokensSaved} tokens), kept last ${keepSet.size}`,
+    `[TIME-BASED MC] gap ${Math.round(gapMinutes)}min > ${config.gapThresholdMinutes}min, cleared ${clearedToolIds.length} tool results (~${tokensSaved} tokens), kept last ${Math.max(1, config.keepRecent)}`,
   )
 
   suppressCompactWarning()
